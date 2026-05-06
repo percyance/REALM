@@ -6,7 +6,7 @@ Code + checkpoints accompanying the paper.
 
 Real-time inference configuration:
 
-![Real-time inference configuration](./figure/entire_configuration.pdf)
+![Real-time inference configuration](./figure/entire_configuration.png)
 
 In both datasets, a monkey performs a 2D reaching task with a planar manipulandum while broadband **local field potentials (LFP)** are recorded from a 4×4 mm, 96-channel Utah array implanted in primary motor cortex (M1) and streamed at 100 Hz. The task differs across datasets: in **Makin** (Monkey I, Indy) targets appear at continuously varying random positions on the screen, so reaches are self-paced and sequential; in **Flint** (Monkey C) targets are drawn from a fixed set of radial locations around a center hold, giving the standard 8-direction center-out paradigm. At inference time, each incoming LFP frame is passed through a shared **Neural Tokenizer** (Conv1D → ECA channel attention → linear projection → LayerNorm), a stack of **causal Mamba-2** blocks, and a lightweight linear + skip-linear decoder that outputs 2D end-effector velocity (vₓ, vᵧ). Because the encoder is strictly causal and Mamba-2 admits O(1) per-step recurrent inference, the full pipeline runs in well under 10 ms on commodity edge devices (Raspberry Pi 5 / Jetson Orin Nano), meeting the 100 Hz budget required for closed-loop BCI control.
 
