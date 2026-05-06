@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.ipynb_checkpoints/
+
+# Editors
+.vscode/
+.idea/
+
+# Outputs / runtime artifacts
+output/
+*.log
+*.tmp
+
+# Local data caches
+data/makin/
+data/flint/
+data/*/preprocessed/

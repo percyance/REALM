@@ -1,0 +1,9 @@
+torch>=2.0
+numpy
+scipy
+pandas
+matplotlib
+openpyxl
+tqdm
+h5py
+einops
