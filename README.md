@@ -96,8 +96,6 @@ Public Makin (`real_lfp_makin`) and Flint (`real_lfp_flint`) datasets, broadband
 | REALM-Lbi  | 10.9M | bidir  | Bidirectional ceiling |
 | Teacher    | 10.9M | bidir  | Pretrained backbone for distillation |
 
-Each `*_makin.pt` ckpt stores `{'student_state_dict', 'encoder_kwargs', ...}` so the decoder rebuilds itself; checkpoints are ≤43 MB each (no Git LFS needed).
-
 ## Repo layout
 
 ```
