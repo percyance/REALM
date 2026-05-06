@@ -108,8 +108,7 @@ Each `*_makin.pt` ckpt stores `{'student_state_dict', 'encoder_kwargs', ...}` so
 │   ├── pretrain.py      Stage 1: masked-LFP pretrain (bidirectional teacher)
 │   ├── distill.py       Stage 2: retrospective distillation (teacher → student)
 │   ├── finetune.py      Stage 3: per-session supervised finetune
-│   ├── inference.py     Load ckpt + run inference (with optional FT)
-│   └── make_gif.py      Reproduce the demo GIFs above
+│   └── inference.py     Load ckpt + run inference (with optional FT)
 ├── checkpoints/   # 6 ready-to-use ckpts (Makin, seed=42)
 ├── figure/        # Demo GIFs + result plots
 └── data/          # README only — datasets are external (see above)
