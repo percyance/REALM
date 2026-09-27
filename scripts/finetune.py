@@ -1,70 +1,51 @@
 """
-Per-session supervised fine-tuning + evaluation.
+Per-session supervised fine-tuning of a distilled encoder on the held-out sessions.
 
-For each heldout session independently:
-  - Load pretrained encoder + velocity head (REALMDecoder)
-  - Sequential 80/20 split within session (same as linear probe)
-  - Freeze spatial encoder + first freeze_layers BiMamba2 layers
-  - Train remaining layers + head with MSE loss on velocity
-  - Evaluate R² on the held-out 20%
+Each held-out session is fine-tuned independently, starting from the same checkpoint:
+  - its 5 s segments are split 72/8/20 into training, validation and test folds by the
+    canonical split file (splits/canonical_splits_728020.json);
+  - the checkpoint's encoder is loaded into REALMDecoder with a fresh linear velocity head;
+  - the neural tokenizer (per-channel temporal convolution, ECA, projection, LayerNorm) stays
+    frozen, and the raw-LFP skip is zeroed and frozen so that the prediction comes from the
+    encoder alone; every Mamba-2 layer and the head are trained with an MSE loss on velocity;
+  - training stops early on the per-axis R² of the validation fold (patience 20) and the
+    best epoch's weights are scored once on the test fold (per-axis R²).
+
+The encoder runs causally for a causal checkpoint (REALM) and bidirectionally for a
+bidirectional one (REALM-bi). Flint sessions are read from the Tukey-filtered files written
+by scripts/make_flint_tukey.py unless --no_tukey is given.
 
 Usage:
-    python -m REALM.scripts.finetune_supervised_persession \
-        --pretrained output/pretrain_REALM_teacher_best.pt --freeze_layers 4
-
-    # Freeze all encoder, only train head (comparable to linear probe)
-    python -m REALM.scripts.finetune_supervised_persession \
-        --pretrained output/pretrain_REALM_teacher_best.pt --freeze_layers 6
-
-    # Full finetune (no freeze)
-    python -m REALM.scripts.finetune_supervised_persession \
-        --pretrained output/pretrain_REALM_teacher_best.pt --freeze_layers 0
+    python scripts/finetune.py --ckpt checkpoints/realm_makin.pt --dataset makin --seed 42
+    python scripts/finetune.py --ckpt checkpoints/realm_flint.pt --dataset flint --seed 42
 """
 
 import argparse
 import hashlib
 import json
-import time
 import random
+import sys
+import time
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from pathlib import Path
-from tqdm import tqdm
 
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
+from models import REALMDecoder
 from utils.dataset import (
-    create_test_dataloaders, compute_r2, compute_r2_per_axis,
+    create_test_dataloaders, compute_r2_per_axis, load_canonical_split,
     HELDOUT_MAKIN, HELDOUT_FLINT,
 )
-from models.decoder import REALMDecoder
-from models.configs import (
-    STUDENT_REALM_S_KWARGS, STUDENT_REALM_KWARGS, STUDENT_REALM_L_KWARGS,
-    STUDENT_REALM_BI_KWARGS, STUDENT_REALM_BI_L_KWARGS,
-    STUDENT_REALM_XL_KWARGS, STUDENT_REALM_UXL_KWARGS,
-    STUDENT_REALM_LBI_KWARGS, STUDENT_REALM_XLBI_KWARGS,
-)
-
-ARCH_KWARGS = {
-    # New canonical names
-    'realm_s': STUDENT_REALM_S_KWARGS,
-    'realm':   STUDENT_REALM_KWARGS,
-    'realm_l': STUDENT_REALM_L_KWARGS,
-    'realm_bi':   STUDENT_REALM_BI_KWARGS,
-    'realm_bi_l': STUDENT_REALM_BI_L_KWARGS,
-    # Legacy aliases
-    'realm_xl':   STUDENT_REALM_XL_KWARGS,
-    'realm_uxl':  STUDENT_REALM_UXL_KWARGS,
-    'realm_lbi':  STUDENT_REALM_LBI_KWARGS,
-    'realm_xlbi': STUDENT_REALM_XLBI_KWARGS,
-}
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+# The neural tokenizer, kept frozen during fine-tuning.
+TOKENIZER = ('temporal_conv', 'eca_conv', 'spatial_proj', 'spatial_norm')
 
 
 def set_seed(seed):
@@ -77,149 +58,99 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def load_model(ckpt_path, freeze_layers, random_init=False, random_init_arch='realm_bi',
-               unfreeze_spatial=False, use_session_embed=False,
-               head_layers=1, head_dropout=0.0):
-    """Load pretrained encoder into REALMDecoder, freeze early layers."""
-    if random_init:
-        encoder_kwargs = {**ARCH_KWARGS.get(random_init_arch, STUDENT_REALM_BI_KWARGS), 'max_sessions': 200}
-        model = REALMDecoder(
-            encoder_kwargs=encoder_kwargs, output_dim=2,
-            head_layers=head_layers, head_dropout=head_dropout,
-        ).to(DEVICE)
-        print("  Using random initialization (no pretrained weights)")
+def session_seed(seed, session):
+    """Seed of one session's run: the run seed offset by a hash of the session name."""
+    return seed + int(hashlib.md5(session.encode()).hexdigest(), 16) % (2**31)
+
+
+def resolve(path):
+    """A path as given, or relative to the repository root if it does not exist as given."""
+    p = Path(path)
+    return p if p.exists() or p.is_absolute() else REPO_ROOT / p
+
+
+def load_model(ckpt_path):
+    """REALMDecoder with the checkpoint's encoder weights and a fresh velocity head.
+
+    Accepts a distilled student (REALM, REALM-bi: 'student_state_dict') or the teacher
+    ('encoder_state_dict'). The tokenizer and the unused session table are frozen, and the
+    raw-LFP skip is zeroed and frozen.
+    """
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    encoder_kwargs = dict(ckpt['encoder_kwargs'], max_sessions=200)
+    model = REALMDecoder(encoder_kwargs=encoder_kwargs, output_dim=2).to(DEVICE)
+
+    if 'student_state_dict' in ckpt:
+        enc_state = {k[len('encoder.'):]: v for k, v in ckpt['student_state_dict'].items()
+                     if k.startswith('encoder.')}
+    elif 'encoder_state_dict' in ckpt:
+        enc_state = ckpt['encoder_state_dict']
     else:
-        ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-        encoder_kwargs = ckpt['encoder_kwargs'].copy()
-        encoder_kwargs['max_sessions'] = 200
+        raise ValueError(f"unknown checkpoint format: {list(ckpt)}")
+    # The session table is not transferred: no session identity is used at any stage.
+    msd = model.encoder.state_dict()
+    state = {k: v for k, v in enc_state.items()
+             if 'session_embed' not in k and k in msd and msd[k].shape == v.shape}
+    missing = [k for k in msd if k not in state and 'session_embed' not in k]
+    if missing:
+        raise ValueError(f"{ckpt_path}: encoder weights missing from the checkpoint: {missing}")
+    model.encoder.load_state_dict(state, strict=False)
 
-        model = REALMDecoder(
-            encoder_kwargs=encoder_kwargs, output_dim=2,
-            head_layers=head_layers, head_dropout=head_dropout,
-        ).to(DEVICE)
-
-        # Support distill checkpoint format
-        if 'student_state_dict' in ckpt:
-            raw = ckpt['student_state_dict']
-            prefix = 'encoder.'
-            enc_state = {k[len(prefix):]: v for k, v in raw.items()
-                         if k.startswith(prefix)}
-        elif 'encoder_state_dict' in ckpt:
-            enc_state = ckpt['encoder_state_dict']
-        else:
-            raise ValueError(f"Unknown checkpoint format: {list(ckpt.keys())}")
-        state = {k: v for k, v in enc_state.items()
-                 if 'session_embed' not in k and 'pos_embed' not in k}
-        model.encoder.load_state_dict(state, strict=False)
-
-    n_layers = encoder_kwargs['n_layers']
-
-    # Freeze or unfreeze spatial encoder components
-    if not unfreeze_spatial:
-        for name in ['temporal_conv', 'eca_conv', 'spatial_proj', 'spatial_norm']:
-            module = getattr(model.encoder, name, None)
-            if module is not None:
-                for p in module.parameters():
-                    p.requires_grad = False
-        if not use_session_embed:
-            model.encoder.session_embed.requires_grad_(False)
-    else:
-        # Keep pretrained spatial weights but make them trainable
-        print("  Spatial encoder: keeping pretrained weights, unfrozen for finetune")
-
-    if use_session_embed:
-        nn.init.normal_(model.encoder.session_embed.weight, std=0.02)
-        model.encoder.session_embed.requires_grad_(True)
-        print("  Session embedding: re-initialized & trainable")
-
-    # Freeze first freeze_layers BiMamba2 layers
-    for i in range(min(freeze_layers, n_layers)):
-        for p in model.encoder.layers[i].parameters():
-            p.requires_grad = False
-        for p in model.encoder.layer_norms[i].parameters():
-            p.requires_grad = False
+    for name in TOKENIZER:
+        getattr(model.encoder, name).requires_grad_(False)
+    model.encoder.session_embed.requires_grad_(False)
+    with torch.no_grad():
+        model.skip.weight.zero_()
+        model.skip.bias.zero_()
+    model.skip.requires_grad_(False)
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Trainable: {trainable:,} ({100*trainable/total:.1f}%)  "
-          f"Frozen: {total-trainable:,}  Freeze layers: 0..{freeze_layers-1}/{n_layers-1}")
-
+    print(f"  {'bidirectional' if encoder_kwargs['bidirectional'] else 'causal'} encoder, "
+          f"{encoder_kwargs['n_layers']} layers; trainable {trainable:,} "
+          f"({100 * trainable / total:.1f}%), frozen {total - trainable:,}", flush=True)
     return model, encoder_kwargs
 
 
-class NoSkipWrapper(nn.Module):
-    """Wrapper that disables skip connection for strict linear probe."""
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, lfp_data, session_ids=None, channel_mask=None, **kwargs):
-        out = self.model(lfp_data, session_ids=session_ids,
-                         channel_mask=channel_mask, **kwargs)
-        # Recompute prediction without skip
-        S = self.model.encoder.n_spatial_patches
-        B, C, nb, T = lfp_data.shape
-        encoded = self.model.encoder(lfp_data, session_ids=session_ids,
-                                      channel_mask=channel_mask)
-        if S > 1:
-            encoded = encoded.reshape(B, T, S, -1).mean(dim=2)
-        out['prediction'] = self.model.out_proj(encoded)
-        return out
-
-    def parameters(self):
-        return self.model.parameters()
-
-    def state_dict(self, *args, **kwargs):
-        return self.model.state_dict(*args, **kwargs)
-
-    def load_state_dict(self, *args, **kwargs):
-        return self.model.load_state_dict(*args, **kwargs)
-
-    def train(self, mode=True):
-        self.model.train(mode)
-        return self
-
-    def eval(self):
-        self.model.eval()
-        return self
+@torch.no_grad()
+def evaluate(model, lfp, cmask, tgt, return_pred=False):
+    """Per-axis R² of the model's velocity on a set of segments."""
+    model.eval()
+    loader = DataLoader(TensorDataset(lfp, cmask, tgt), batch_size=64, shuffle=False)
+    preds, targets = [], []
+    for x, m, y in loader:
+        preds.append(model(x.to(DEVICE), channel_mask=m.to(DEVICE))['prediction'].cpu())
+        targets.append(y)
+    preds = torch.cat(preds, dim=0).reshape(-1, 2)
+    targets = torch.cat(targets, dim=0).reshape(-1, 2)
+    r2 = compute_r2_per_axis(preds, targets)
+    if return_pred:
+        return r2, preds.numpy(), targets.numpy()
+    return r2
 
 
-def finetune_session(model, train_lfp, train_cmask, train_tgt, args,
-                     test_lfp=None, test_cmask=None, test_tgt=None):
-    """Supervised finetune on one session's training split."""
-    sid = torch.zeros(len(train_lfp), dtype=torch.long)
-    ds = TensorDataset(train_lfp, train_cmask, train_tgt, sid)
+def finetune_session(model, train, val, args):
+    """Fine-tune on the training fold; keep the epoch with the best validation R²."""
     g = torch.Generator()
     g.manual_seed(args.seed)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=False,
-                        generator=g)
-
-    optimizer = optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=args.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
-    )
+    loader = DataLoader(TensorDataset(*train), batch_size=args.batch_size, shuffle=True,
+                        drop_last=False, generator=g)
+    optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                            lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
     criterion = nn.MSELoss()
 
-    best_r2 = -float('inf')
-    best_state = None
-    patience = 0
-
-    pbar = tqdm(range(1, args.epochs + 1), desc="    Finetune", leave=True)
-    for epoch in pbar:
+    best_r2, best_state, best_epoch, bad = -float('inf'), None, 0, 0
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        lr = optimizer.param_groups[0]['lr']
         model.train()
         total_loss, n = 0.0, 0
-        for lfp, cmask, tgt, sid_b in loader:
-            lfp = lfp.to(DEVICE)
-            cmask = cmask.to(DEVICE)
-            tgt = tgt.to(DEVICE)
+        for x, m, y in loader:
+            x, m, y = x.to(DEVICE), m.to(DEVICE), y.to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
-            s_ids = sid_b.to(DEVICE) if args.use_session_embed else None
-            out = model(lfp, session_ids=s_ids, channel_mask=cmask)
-            pred = out['prediction']  # (B, T, 2)
-            loss = criterion(pred, tgt)
+            loss = criterion(model(x, channel_mask=m)['prediction'], y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -227,262 +158,131 @@ def finetune_session(model, train_lfp, train_cmask, train_tgt, args,
             n += 1
         scheduler.step()
 
-        avg = total_loss / max(n, 1)
-
-        # Use val R² as best criterion
-        val_r2 = evaluate_session(model, test_lfp, test_cmask, test_tgt,
-                                  use_session_embed=args.use_session_embed,
-                                  r2_mode=args.r2_mode)
-        is_best = val_r2 > best_r2
-        if is_best:
-            best_r2 = val_r2
+        val_r2 = evaluate(model, *val)
+        improved = val_r2 > best_r2
+        if improved:
+            best_r2, best_epoch, bad = val_r2, epoch, 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience = 0
         else:
-            patience += 1
-            if patience >= args.patience:
-                pbar.close()
-                print(f"    Early stop at epoch {epoch}  best_R2={best_r2:.4f}")
-                break
+            bad += 1
+        print(f"    epoch {epoch:3d}  train_loss {total_loss / max(n, 1):.5f}  "
+              f"val_R2 {val_r2:.4f}  best {best_r2:.4f}  lr {lr:.2e}  "
+              f"{time.time() - t0:.1f}s{'  *' if improved else ''}", flush=True)
+        if bad >= args.patience:
+            print(f"    early stop at epoch {epoch}; best epoch {best_epoch}", flush=True)
+            break
 
-        postfix = {"loss": f"{avg:.5f}", "R2": f"{val_r2:.4f}", "best_R2": f"{best_r2:.4f}", "pat": patience}
-        if is_best:
-            postfix["*"] = "best"
-        pbar.set_postfix(postfix)
-
-    if best_state is not None:
+    if best_state is not None:          # no epoch improved (e.g. NaN): keep the last weights
         model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
-    return model
-
-
-@torch.no_grad()
-def evaluate_session(model, test_lfp, test_cmask, test_tgt, use_session_embed=False, r2_mode='combined'):
-    """Evaluate R² on test split."""
-    model.eval()
-    sid = torch.zeros(len(test_lfp), dtype=torch.long)
-    ds = TensorDataset(test_lfp, test_cmask, test_tgt, sid)
-    loader = DataLoader(ds, batch_size=64, shuffle=False)
-
-    preds, targets = [], []
-    for lfp, cmask, tgt, sid_b in loader:
-        s_ids = sid_b.to(DEVICE) if use_session_embed else None
-        out = model(lfp.to(DEVICE), session_ids=s_ids,
-                    channel_mask=cmask.to(DEVICE))
-        preds.append(out['prediction'].cpu())
-        targets.append(tgt)
-
-    preds = torch.cat(preds, dim=0).reshape(-1, 2)
-    targets = torch.cat(targets, dim=0).reshape(-1, 2)
-    if r2_mode == 'per_axis':
-        return compute_r2_per_axis(preds, targets)
-    return compute_r2(preds, targets)
+    return model, best_r2, best_epoch
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Per-session supervised finetune (isolated per heldout session)")
-    parser.add_argument('--pretrained', type=str,
-                        default='output/distill_REALM_bi_student_best.pt')
-    parser.add_argument('--freeze_layers', type=int, default=4,
-                        help="Freeze first N BiMamba2 layers (0=full finetune, 6=head only)")
-    parser.add_argument('--epochs', type=int, default=150)
-    parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--weight_decay', type=float, default=1e-5)
-    parser.add_argument('--patience', type=int, default=20)
+        description="Per-session supervised fine-tuning on the held-out sessions. The neural "
+                    "tokenizer stays frozen and the raw-LFP skip is zeroed; every Mamba-2 "
+                    "layer and a fresh linear head are trained.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--ckpt', required=True,
+                        help="distilled student (REALM / REALM-bi) or teacher checkpoint")
+    parser.add_argument('--dataset', required=True, choices=['makin', 'flint'],
+                        help="corpus whose held-out sessions are fine-tuned and scored")
+    parser.add_argument('--seed', type=int, default=42,
+                        help="run seed; also selects the split of the split file")
+    parser.add_argument('--splits_file', default='splits/canonical_splits_728020.json',
+                        help="72/8/20 train/validation/test split of each held-out session")
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--patience', type=int, default=20,
+                        help="early-stopping patience on the validation R²")
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--train_ratio', type=float, default=0.8)
-    parser.add_argument('--random_split', action='store_true', default=True,
-                        help="Random train/test split (default: True)")
-    parser.add_argument('--sequential_split', action='store_true',
-                        help="Override to sequential split")
-    parser.add_argument('--fixed_test_ratio', type=float, default=0.0,
-                        help="If >0, fix last fixed_test_ratio fraction as test "
-                             "set (sequential), then sample train_ratio*n samples "
-                             "from the remaining first (1-fixed_test_ratio) "
-                             "fraction. Enables fair within-condition fewshot "
-                             "comparison across train_ratios.")
-    parser.add_argument('--shuffled_fixed_test', action='store_true',
-                        help="With --fixed_test_ratio: random shuffle first, then "
-                             "test = last fixed_test_ratio of shuffled (random 20pct), "
-                             "train = first train_ratio*n of shuffled remainder. "
-                             "Avoids time-drift on the test set.")
-    parser.add_argument('--segment_length', type=int, default=500)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--datasets', type=str, nargs='+',
-                        default=['makin', 'flint'],
-                        choices=['makin', 'flint'],
-                        help="Which datasets to evaluate (default: both)")
-    parser.add_argument('--tag', type=str, default='',
-                        help="Extra tag appended to output filename (e.g. 'ep050')")
-    parser.add_argument('--random_init', action='store_true',
-                        help="Use random initialization (no pretrained weights)")
-    parser.add_argument('--random_init_arch', type=str, default='realm_bi',
-                        choices=['realm_s', 'realm', 'realm_l',
-                                 'realm_bi', 'realm_bi_l',
-                                 'realm_xl', 'realm_uxl', 'realm_lbi', 'realm_xlbi'],
-                        help="Architecture for random init (default: realm_bi)")
-    parser.add_argument('--unfreeze_spatial', action='store_true',
-                        help="Unfreeze & re-init spatial encoder for per-session adaptation")
-    parser.add_argument('--save_model', action='store_true',
-                        help="Save finetuned model per session for visualization")
-    parser.add_argument('--use_session_embed', action='store_true',
-                        help="Enable session embedding (trainable per-session bias)")
-    parser.add_argument('--no_skip', action='store_true',
-                        help="Disable skip connection for strict linear probe")
-    parser.add_argument('--r2_mode', type=str, default='combined',
-                        choices=['combined', 'per_axis'],
-                        help="R2 computation: combined or per_axis (avg across vx,vy)")
-    parser.add_argument('--head_layers', type=int, default=1,
-                        help="Number of layers in out_proj head (1=linear, 3=MLP)")
-    parser.add_argument('--head_dropout', type=float, default=0.0,
-                        help="Dropout probability inside multi-layer head (only used if head_layers>1)")
+    parser.add_argument('--lr', type=float, default=5e-4,
+                        help="peak learning rate; cosine annealing to 1%% of it")
+    parser.add_argument('--weight_decay', type=float, default=1e-5)
+    parser.add_argument('--out', default=None,
+                        help="result JSON (default: output/finetune_<ckpt>_<dataset>_s<seed>.json)")
+    parser.add_argument('--dump_pred', default=None, metavar='DIR',
+                        help="write each session's test-fold predictions and targets here")
+    parser.add_argument('--save_dir', default=None, metavar='DIR',
+                        help="write each session's fine-tuned weights here")
+    parser.add_argument('--no_tukey', action='store_true',
+                        help="read Flint from the unfiltered files instead of the Tukey-filtered ones")
     args = parser.parse_args()
 
-    if args.sequential_split:
-        args.random_split = False
+    ckpt_path = resolve(args.ckpt)
+    splits_file = resolve(args.splits_file)
+    tukey = args.dataset == 'flint' and not args.no_tukey
+    heldout = HELDOUT_MAKIN if args.dataset == 'makin' else HELDOUT_FLINT
+
     set_seed(args.seed)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Device: {DEVICE}")
-    split_mode = "random" if args.random_split else "sequential"
-    print(f"Freeze layers: {args.freeze_layers}  Epochs: {args.epochs}  LR: {args.lr}  Split: {split_mode}")
+    print(f"Device: {DEVICE}  checkpoint: {ckpt_path}  dataset: {args.dataset}  "
+          f"seed: {args.seed}  tukey_flint: {tukey}", flush=True)
+    loaders = create_test_dataloaders(batch_size=256, tukey_flint=tukey, datasets=[args.dataset])
+    missing = sorted(set(heldout) - set(loaders))
+    if missing:
+        raise FileNotFoundError(f"held-out sessions not found under the data root: {missing}")
+    print("  segments: " + "  ".join(f"{s}={len(loaders[s].dataset)}" for s in sorted(heldout)),
+          flush=True)
 
-    base_dir = Path(__file__).resolve().parent.parent
-    ckpt_path = base_dir / args.pretrained
-    if not ckpt_path.exists():
-        print(f"ERROR: {ckpt_path} not found")
-        return
-
-    test_loaders = create_test_dataloaders(
-        segment_length=args.segment_length, batch_size=256)
-
-    # Filter by selected datasets
-    active_heldout = set()
-    if 'makin' in args.datasets:
-        active_heldout.update(HELDOUT_MAKIN)
-    if 'flint' in args.datasets:
-        active_heldout.update(HELDOUT_FLINT)
-    test_loaders = {k: v for k, v in test_loaders.items() if k in active_heldout}
-    print(f"Test sessions: {len(test_loaders)} (datasets={args.datasets})")
-
-    per_session_r2 = {}
-
-    for sess_name, loader in sorted(test_loaders.items()):
+    per_session, per_session_val, best_epochs = {}, {}, {}
+    for sess in sorted(heldout):
         t0 = time.time()
+        set_seed(session_seed(args.seed, sess))
+        print(f"\n{sess}", flush=True)
 
-        # Per-session deterministic seed for reproducible splits
-        sess_hash = int(hashlib.md5(sess_name.encode()).hexdigest(), 16) % (2**31)
-        set_seed(args.seed + sess_hash)
+        lfp, cmask, tgt = [], [], []
+        for batch in loaders[sess]:
+            lfp.append(batch['lfp'])
+            cmask.append(batch['channel_mask'])
+            tgt.append(batch['target'])
+        lfp, cmask, tgt = torch.cat(lfp), torch.cat(cmask), torch.cat(tgt)
 
-        # Collect all data from this session
-        all_lfp, all_cmask, all_tgt = [], [], []
-        for batch in loader:
-            all_lfp.append(batch['lfp'])
-            all_cmask.append(batch['channel_mask'])
-            all_tgt.append(batch['target'])
-        all_lfp = torch.cat(all_lfp, dim=0)    # (N, 96, 1, T)
-        all_cmask = torch.cat(all_cmask, dim=0) # (N, 96)
-        all_tgt = torch.cat(all_tgt, dim=0)     # (N, T, 2)
+        tr, va, te = (torch.tensor(i) for i in load_canonical_split(
+            splits_file, sess, args.seed, len(lfp), tukey_flint=tukey))
+        print(f"  split: {len(tr)} train / {len(va)} val / {len(te)} test segments", flush=True)
 
-        # Train/test split
-        n = len(all_lfp)
-        if args.fixed_test_ratio > 0.0:
-            # Fixed-test mode: test set fixed at fixed_test_ratio fraction.
-            # Train sampled from the remaining pool, capped at train_ratio*n.
-            n_test = int(args.fixed_test_ratio * n)
-            n_train_pool = n - n_test
-            n_train = min(int(args.train_ratio * n), n_train_pool)
-            if args.shuffled_fixed_test:
-                # Shuffle then split: random 20% test (scattered across session),
-                # train sampled from remaining 80% pool.
-                indices = torch.randperm(n)
-                test_idx = indices[-n_test:]
-                train_pool = indices[:-n_test]
-                train_idx = train_pool[:n_train]
-            else:
-                # Sequential: last n_test (time-end) as test.
-                test_idx = torch.arange(n_train_pool, n)
-                if args.random_split:
-                    pool_perm = torch.randperm(n_train_pool)
-                    train_idx = pool_perm[:n_train]
-                else:
-                    train_idx = torch.arange(n_train)
-            train_lfp, test_lfp = all_lfp[train_idx], all_lfp[test_idx]
-            train_cmask, test_cmask = all_cmask[train_idx], all_cmask[test_idx]
-            train_tgt, test_tgt = all_tgt[train_idx], all_tgt[test_idx]
-        else:
-            split = int(args.train_ratio * n)
-            if args.random_split:
-                indices = torch.randperm(n)
-                train_idx, test_idx = indices[:split], indices[split:]
-                train_lfp, test_lfp = all_lfp[train_idx], all_lfp[test_idx]
-                train_cmask, test_cmask = all_cmask[train_idx], all_cmask[test_idx]
-                train_tgt, test_tgt = all_tgt[train_idx], all_tgt[test_idx]
-            else:
-                train_lfp, test_lfp = all_lfp[:split], all_lfp[split:]
-                train_cmask, test_cmask = all_cmask[:split], all_cmask[split:]
-                train_tgt, test_tgt = all_tgt[:split], all_tgt[split:]
+        model, encoder_kwargs = load_model(ckpt_path)
+        model, val_r2, best_epoch = finetune_session(
+            model, (lfp[tr], cmask[tr], tgt[tr]), (lfp[va], cmask[va], tgt[va]), args)
 
-        # Load fresh model for each session
-        model, _ = load_model(ckpt_path, args.freeze_layers,
-                              random_init=args.random_init,
-                              random_init_arch=args.random_init_arch,
-                              unfreeze_spatial=args.unfreeze_spatial,
-                              use_session_embed=args.use_session_embed,
-                              head_layers=args.head_layers,
-                              head_dropout=args.head_dropout)
-        if args.no_skip:
-            model = NoSkipWrapper(model)
-            print("  Skip connection disabled (strict linear probe)")
+        # The test fold is scored once, with the selected weights, in ascending segment order.
+        te = te[torch.argsort(te)]
+        r2, pred, target = evaluate(model, lfp[te], cmask[te], tgt[te], return_pred=True)
+        per_session[sess], per_session_val[sess], best_epochs[sess] = r2, val_r2, best_epoch
+        print(f"  {sess}: test R2 {r2:.4f}  (val R2 {val_r2:.4f}, best epoch {best_epoch}, "
+              f"{time.time() - t0:.0f}s)", flush=True)
 
-        # Supervised finetune on train split
-        model = finetune_session(model, train_lfp, train_cmask, train_tgt, args,
-                                 test_lfp=test_lfp, test_cmask=test_cmask, test_tgt=test_tgt)
-
-        # Evaluate on test split
-        r2 = evaluate_session(model, test_lfp, test_cmask, test_tgt,
-                              use_session_embed=args.use_session_embed,
-                              r2_mode=args.r2_mode)
-        per_session_r2[sess_name] = r2
-        elapsed = time.time() - t0
-        print(f"  {sess_name:<25} R2={r2:.4f}  ({elapsed:.1f}s)")
-
-        if args.save_model:
-            tag_suffix = f"_{args.tag}" if args.tag else ""
-            model_path = OUTPUT_DIR / f"finetuned_{sess_name}{tag_suffix}.pt"
-            torch.save(model.state_dict(), model_path)
-            print(f"  Saved model to {model_path.name}")
-
+        if args.dump_pred:
+            d = Path(args.dump_pred)
+            d.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(d / f"{sess}.npz", pred=pred, target=target, test_idx=te.numpy())
+        if args.save_dir:
+            d = Path(args.save_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            torch.save({'model_state_dict': model.state_dict(), 'encoder_kwargs': encoder_kwargs,
+                        'session': sess, 'seed': args.seed, 'test_r2': r2, 'val_r2': val_r2},
+                       d / f"finetuned_{sess}_s{args.seed}.pt")
         del model
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # Summary
-    makin_r2s = [per_session_r2[s] for s in per_session_r2 if s in HELDOUT_MAKIN]
-    flint_r2s = [per_session_r2[s] for s in per_session_r2 if s in HELDOUT_FLINT]
-    makin_mean = float(np.mean(makin_r2s)) if makin_r2s else 0.0
-    flint_mean = float(np.mean(flint_r2s)) if flint_r2s else 0.0
-    overall_mean = float(np.mean(list(per_session_r2.values())))
-
-    print(f"\n  Makin mean R2:   {makin_mean:.4f}")
-    print(f"  Flint mean R2:   {flint_mean:.4f}")
-    print(f"  Overall mean R2: {overall_mean:.4f}")
+    mean_r2 = float(np.mean(list(per_session.values())))
+    print(f"\nmean test R2 over {len(per_session)} {args.dataset} sessions: {mean_r2:.4f}")
+    for s, v in per_session.items():
+        print(f"  {s:<20} {v:.4f}")
 
     result = {
-        'per_session_r2': per_session_r2,
-        'makin_mean': makin_mean,
-        'flint_mean': flint_mean,
-        'overall_mean': overall_mean,
-        'freeze_layers': args.freeze_layers,
-        'epochs': args.epochs,
-        'datasets': args.datasets,
+        'checkpoint': str(args.ckpt), 'dataset': args.dataset, 'seed': args.seed,
+        'splits_file': str(args.splits_file), 'tukey_flint': tukey,
+        'per_session_r2': per_session, 'mean_r2': mean_r2,
+        'per_session_val_r2': per_session_val, 'best_epoch': best_epochs,
+        'settings': {k: getattr(args, k) for k in
+                     ('epochs', 'patience', 'batch_size', 'lr', 'weight_decay')},
     }
-    suffix = "_randsplit" if args.random_split else ""
-    ds_suffix = "_" + "_".join(sorted(args.datasets)) if sorted(args.datasets) != ['flint', 'makin'] else ""
-    seed_suffix = f"_s{args.seed}" if args.seed != 42 else ""
-    tag_suffix = f"_{args.tag}" if args.tag else ""
-    out_path = OUTPUT_DIR / f"finetune_sup_persession_freeze{args.freeze_layers}{suffix}{ds_suffix}{seed_suffix}{tag_suffix}.json"
-    with open(out_path, 'w') as f:
-        json.dump(result, f, indent=2)
-    print(f"\nSaved to {out_path}")
+    out = Path(args.out) if args.out else (
+        REPO_ROOT / 'output' / f"finetune_{Path(args.ckpt).stem}_{args.dataset}_s{args.seed}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=2))
+    print(f"saved {out}")
 
 
 if __name__ == '__main__':

@@ -1,47 +1,73 @@
-# REALM: Retrospectively-Distilled Causal Mamba-2 for Real-Time Neural Decoding
+# REALM: Retrospective Encoder Alignment for LFP Modeling
 
-Code + checkpoints accompanying the paper.
+Code and checkpoints for **REALM**, a causal decoder of arm velocity from intracortical local field
+potentials (LFP). A bidirectional Mamba-2 teacher is pretrained on unlabeled LFP with continuous
+masked autoencoding; its representations are then transferred to a causal Mamba-2 student by
+**retrospective knowledge distillation (RKD)**, without any behavioral labels. The causal student
+decodes one velocity estimate per incoming LFP sample at 100 Hz.
 
 ## Configuration
 
-Real-time inference configuration:
+![Experimental configuration](./figure/entire_configuration.png)
 
-![Real-time inference configuration](./figure/entire_configuration.png)
-
-In both datasets, a monkey performs a 2D reaching task with a planar manipulandum while broadband **local field potentials (LFP)** are recorded from a 4×4 mm, 96-channel Utah array implanted in primary motor cortex (M1) and streamed at 100 Hz. The task differs across datasets: in **Makin** (Monkey I, Indy) targets appear at continuously varying random positions on the screen, so reaches are self-paced and sequential; in **Flint** (Monkey C) targets are drawn from a fixed set of radial locations around a center hold, giving the standard 8-direction center-out paradigm. At inference time, each incoming LFP frame is passed through a shared **Neural Tokenizer** (Conv1D → ECA channel attention → linear projection → LayerNorm), a stack of **causal Mamba-2** blocks, and a lightweight linear + skip-linear decoder that outputs 2D end-effector velocity (vₓ, vᵧ). Because the encoder is strictly causal and Mamba-2 admits O(1) per-step recurrent inference, the full pipeline runs in well under 10 ms on commodity edge devices (Raspberry Pi 5 / Jetson Orin Nano), meeting the 100 Hz budget required for closed-loop BCI control.
+Two public datasets are used, both recorded with a 96-channel Utah array in primary motor cortex:
+**Makin** (Monkey I; O'Doherty et al.), a self-paced sequential reaching task to random targets,
+and **Flint** (Monkey C), a center-out task. The raw LFP is band-limited to 0.05-50 Hz and resampled
+to 100 Hz. At inference time each LFP frame passes through the **Neural Tokenizer** (per-channel
+temporal convolution, ECA channel attention, linear projection, LayerNorm), a stack of **causal
+Mamba-2** layers, and a linear read-out of the 2D velocity.
 
 ## Demo
 
-Real-time decoding from broadband LFP. Each clip shows the input LFP channels (left), predicted vs. ground-truth velocity (middle), and the reconstructed 2D cursor trace (right). Model: REALM (4.9M) 5-Fold Ensemble.
+Each clip replays one held-out test segment (5 s at 100 Hz) in real time: the LFP input (left), the
+velocity decoded by REALM after per-session fine-tuning against the recorded velocity (middle), and
+the 2D position obtained by integrating each velocity (right). The segments are the ones shown in
+the paper's trace panels.
 
-**Makin (Monkey I)**
+**Makin (Monkey I), held-out session indy_20160622_01**
 
 ![Makin demo](figure/anim_lfp_vel_trace_makin.gif)
 
-**Flint (Monkey C)**
+**Flint (Monkey C), held-out session Flint_e4_1**
 
 ![Flint demo](figure/anim_lfp_vel_trace_flint.gif)
 
-## Methodology
+## Method
 
-REALM is trained in three stages:
+1. **Masked pretraining of the teacher.** A bidirectional Mamba-2 (BiMamba-2) teacher (10 layers,
+   11.5 M parameters) is pretrained with continuous masked autoencoding (CMAE) on the 34
+   non-held-out sessions of Makin and Flint: blocks of 10-50 time steps covering 60% of each 5 s
+   segment are masked and reconstructed in LFP space.
 
-1. **Unsupervised pretraining.** A bidirectional Mamba-2 teacher is pretrained on **130 hours of LFP** with a Continuous Masked Autoencoding (CMAE) objective — random temporal spans are masked and reconstructed in the continuous LFP space, yielding session-agnostic representations.
+   ![Stage 1: CMAE pretraining](figure/pretrain.png)
 
-   ![Stage 1 — CMAE pretraining](figure/pretrain.png)
+2. **Retrospective knowledge distillation.** A causal Mamba-2 student is distilled from the frozen
+   teacher with two terms: a cosine alignment between the student's and the teacher's last-layer
+   representations at every time step, and a reconstruction of the input LFP from the student's
+   causal representation (lambda_repr = lambda_ae = 1). No behavioral label enters distillation
+   (lambda_task = 0). One student is distilled per corpus.
 
-2. **Retrospective distillation.** A causal Mamba-2 student is distilled from the frozen teacher under two jointly optimized objectives: a **representation-level cosine alignment** loss between the student's last-layer hidden states and the teacher's, and a downstream **velocity-reconstruction** loss. The bidirectional teacher provides the "future-aware" supervision the causal student cannot see at inference time.
+   ![Stage 2: retrospective knowledge distillation](figure/distill.png)
 
-   ![Stage 2 — Retrospective distillation](figure/distill.png)
+3. **Evaluation on held-out sessions**, in two regimes:
+   - *label-free*: the encoder stays frozen and a ridge read-out on the past 10 frames of its
+     output is fitted on each held-out session;
+   - *fine-tuned*: the encoder is adapted on each held-out session with velocity labels (the neural
+     tokenizer stays frozen).
 
-3. **Per-session finetuning.** The distilled causal student is briefly finetuned on each held-out session to adapt to subject- and session-specific neural variability.
+The same recipe with a bidirectional student gives **REALM-bi**, an offline (non-causal) reference.
 
-## Highlights
+![Neural tokenizer module](figure/neural_tokenizer_module.png)
 
-- **Bidirectional teacher → causal student** retrospective distillation
-- **Mamba-2** backbone with O(1) per-step recurrent inference (real-time on CPU / Jetson)
-- 3 causal sizes (REALM-S 2.1M / REALM 4.9M / REALM-L 10.5M) + 2 bidirectional references (REALM-bi 5M, REALM-Lbi 10.9M)
-- 5-fold disjoint stacking ensemble (free +0.025–0.043 R² lift, no extra training)
+## Results
+
+Per-axis R² on the eight held-out sessions (five Makin, three Flint), each split 72/8/20 into
+training, validation and test folds; mean over sessions and three seeds (42, 123, 456).
+
+| Model | Params | Direction | Label-free | Fine-tuned |
+|---|---|---|---|---|
+| REALM    | 4.91 M | causal        | 0.561 (Makin 0.519, Flint 0.630) | 0.686 (Makin 0.677, Flint 0.701) |
+| REALM-bi | 5.54 M | bidirectional | 0.588 (Makin 0.547, Flint 0.656) | - |
 
 ## Setup
 
@@ -49,65 +75,107 @@ REALM is trained in three stages:
 pip install -r requirements.txt
 ```
 
-Tested on Python 3.9+, PyTorch ≥ 2.0. Pure PyTorch — no `mamba_ssm` CUDA kernel needed, so CPU and Jetson inference work out of the box.
-
-## Quick inference (uses bundled checkpoint)
-
-```bash
-# 80/20 supervised finetune per session
-python scripts/inference.py --ckpt checkpoints/realm_makin.pt \
-    --datasets makin --finetune --train_ratio 0.8
-
-# Zero-shot from distillation (no per-session finetune)
-python scripts/inference.py --ckpt checkpoints/realm_makin.pt --datasets makin
-```
-
-## Reproducing the pipeline (3 stages)
-
-```bash
-# 1. Unsupervised teacher pretrain (masked-LFP)
-python scripts/pretrain.py --datasets makin --epochs 200 --batch_size 16 \
-    --tag teacher_m1only
-
-# 2. Retrospective distillation: teacher → causal/bidir student
-python scripts/distill.py --pretrained checkpoints/teacher_m1only.pt \
-    --student_size realm --datasets makin --loss_type realm \
-    --lambda_repr 1.0 --lambda_ae 0.1 --align_layers 1 \
-    --epochs 300 --patience 30 --tag distill_realm_makin
-# --student_size: realm_s | realm | realm_l | realm_bi | realm_lbi
-
-# 3. Per-session supervised finetune
-python scripts/finetune.py --pretrained checkpoints/realm_makin.pt \
-    --datasets makin --train_ratio 0.8 --freeze_layers 0 --epochs 150 --tag eval
-```
+Tested with Python 3.10 and PyTorch 2.8 on NVIDIA A100 GPUs. The Mamba-2 layers are written in pure
+PyTorch, so no `mamba_ssm` CUDA kernels are needed and the models also run on CPU.
 
 ## Data
 
-Public Makin (`real_lfp_makin`) and Flint (`real_lfp_flint`) datasets, broadband LFP at 100 Hz. Place processed `.npz` per session under `data/Makin/` and `data/Flint/` — see `utils/dataset.py` for the expected layout. Released checkpoints are trained on the Makin subset (29 sessions, 5 held out); Flint and multi-dataset runs use the same scripts.
+Download the public releases (see [data/README.md](data/README.md)), then build the 100 Hz LFP files
+and the evaluation splits:
 
-## Architectures
+```bash
+export REALM_DATA=/path/to/data          # defaults to ./data
+python scripts/preprocess_makin.py       # -> $REALM_DATA/makin/preprocessed/lfp/*_rawlfp.npz
+python scripts/preprocess_flint.py       # -> $REALM_DATA/flint/preprocessed/lfp/*_rawlfp.npz
+python scripts/make_flint_tukey.py       # held-out Flint sessions, artifact windows removed
+python scripts/make_splits.py            # optional: rebuilds splits/canonical_splits_728020.json
+# the preprocessing scripts take --session <name> for a single session; --help lists all options
+```
 
-| Name | Params | Direction | Use case |
-|---|---|---|---|
-| REALM-S    |  2.1M | causal | Smallest — Jetson Nano latency-priority |
-| REALM      |  4.9M | causal | Main causal model |
-| REALM-L    | 10.5M | causal | Largest causal — accuracy priority |
-| REALM-bi   |  5.0M | bidir  | Distilled bidir reference |
-| REALM-Lbi  | 10.9M | bidir  | Bidirectional ceiling |
-| Teacher    | 10.9M | bidir  | Pretrained backbone for distillation |
+The held-out sessions are the eight used by CrossModalDistill: Makin `indy_20160622_01`,
+`indy_20160630_01`, `indy_20160915_01`, `indy_20161013_03`, `indy_20170124_01` and Flint
+`Flint_e1_1`, `Flint_e4_1`, `Flint_e5_2`. Each is cut into non-overlapping 5 s segments that are
+split 72/8/20 by `splits/canonical_splits_728020.json`; the test fold is never used for fitting.
 
-## Repo layout
+## Checkpoints
+
+| File | Model | Trained on |
+|---|---|---|
+| `checkpoints/teacher.pt`        | BiMamba-2 teacher (11.50 M) | 34 non-held-out Makin + Flint sessions |
+| `checkpoints/realm_makin.pt`    | REALM, causal (4.91 M)      | distilled on the Makin sessions |
+| `checkpoints/realm_flint.pt`    | REALM, causal (4.91 M)      | distilled on the Flint sessions |
+| `checkpoints/realm_bi_makin.pt` | REALM-bi (5.54 M)           | distilled on the Makin sessions |
+| `checkpoints/realm_bi_flint.pt` | REALM-bi (5.54 M)           | distilled on the Flint sessions |
+
+All students are the seed-42 models of the paper.
+
+## Evaluate the released models
+
+```bash
+# label-free: frozen encoder + ridge read-out on each held-out session
+python scripts/eval_labelfree.py --ckpt checkpoints/realm_makin.pt    --dataset makin --seed 42
+python scripts/eval_labelfree.py --ckpt checkpoints/realm_bi_flint.pt --dataset flint --seed 42
+
+# per-session supervised fine-tuning (the neural tokenizer stays frozen)
+python scripts/finetune.py --ckpt checkpoints/realm_makin.pt --dataset makin --seed 42
+```
+
+Both scripts print the R² of every held-out session and write a JSON under `output/`. With the
+released seed-42 checkpoints they reproduce the paper's seed-42 runs exactly:
+
+| Model | Regime | Makin | Flint | All eight |
+|---|---|---|---|---|
+| REALM    | label-free | 0.520 | 0.624 | 0.559 |
+| REALM-bi | label-free | 0.551 | 0.645 | 0.586 |
+| REALM    | fine-tuned | 0.681 | 0.690 | 0.684 |
+
+## Reproduce the pipeline
+
+```bash
+# 1. teacher: continuous masked autoencoding on the 34 non-held-out sessions
+#    (paper: 16 GPUs x batch 24; the effective batch scales with the number of GPUs)
+torchrun --nproc-per-node=<GPUs> scripts/pretrain.py --out output/teacher.pt
+
+# 2. retrospective distillation, one student per corpus and seed
+python scripts/distill.py --teacher output/teacher.pt --student realm    --dataset makin --seed 42
+python scripts/distill.py --teacher output/teacher.pt --student realm_bi --dataset flint --seed 42
+
+# 3. evaluation of each student, as above, for seeds 42, 123 and 456
+```
+
+Every script's defaults are the settings used in the paper; `--help` lists them. Training on GPU is
+not bitwise reproducible from run to run (differences of order 1e-6 in the weights); with PyTorch's
+deterministic mode the distillation reproduces the paper's runs bitwise.
+
+## Repository layout
 
 ```
 .
-├── models/        # Encoder / Decoder / Layers / Configs (pure PyTorch)
-├── utils/         # Dataset loader, masked pretraining, distill losses
+├── models/        Neural tokenizer, Mamba-2 / BiMamba-2 layers, encoder, read-out, configurations
+├── utils/         Data loading and splits, block masking, distillation loss, augmentations
 ├── scripts/
-│   ├── pretrain.py      Stage 1: masked-LFP pretrain (bidirectional teacher)
-│   ├── distill.py       Stage 2: retrospective distillation (teacher → student)
-│   ├── finetune.py      Stage 3: per-session supervised finetune
-│   └── inference.py     Load ckpt + run inference (with optional FT)
-├── checkpoints/   # 6 ready-to-use ckpts (Makin, seed=42)
-├── figure/        # Demo GIFs + result plots
-└── data/          # README only — datasets are external (see above)
+│   ├── preprocess_makin.py   raw recordings -> 100 Hz LFP (Makin)
+│   ├── preprocess_flint.py   raw recordings -> 100 Hz LFP (Flint)
+│   ├── preprocessing_utils.py  filtering, re-referencing and resampling shared by both
+│   ├── make_flint_tukey.py   artifact-window removal for the held-out Flint sessions
+│   ├── make_splits.py        72/8/20 splits of the held-out sessions
+│   ├── pretrain.py           stage 1: CMAE pretraining of the teacher
+│   ├── distill.py            stage 2: retrospective distillation (REALM / REALM-bi)
+│   ├── eval_labelfree.py     label-free ridge read-out on held-out sessions
+│   └── finetune.py           per-session supervised fine-tuning
+├── splits/        canonical 72/8/20 splits of the eight held-out sessions
+├── checkpoints/   teacher, REALM and REALM-bi (seed 42)
+├── figure/        configuration, method figures and demo GIFs
+└── data/          README only; the datasets are downloaded separately
+```
+
+## Citation
+
+```bibtex
+@article{wu2026realm,
+  title   = {{REALM}: Retrospective Encoder Alignment for {LFP} Modeling},
+  author  = {Wu, Peicheng and Bu, Zhenyu and Ma, Runze and Du, Lin},
+  journal = {arXiv preprint arXiv:2605.14867},
+  year    = {2026}
+}
 ```

@@ -1,36 +1,11 @@
-"""Data augmentation and regularization modules for LFP pretraining."""
+"""Data augmentation for masked LFP pretraining."""
 
 import torch
 import torch.nn as nn
 
 
-class DropPath(nn.Module):
-    """Stochastic depth for residual branches.
-
-    During training, randomly drops entire residual branches with
-    probability `drop_prob`. Identity at eval time.
-
-    Ref: Huang et al., "Deep Networks with Stochastic Depth", ECCV 2016
-    """
-
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.drop_prob == 0.0:
-            return x
-        keep = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask = torch.rand(shape, dtype=x.dtype, device=x.device) < keep
-        return x * mask / keep
-
-    def extra_repr(self):
-        return f"drop_prob={self.drop_prob:.3f}"
-
-
 class PretrainAugmentation(nn.Module):
-    """Data augmentation for MAE pretraining.
+    """Data augmentation for masked-autoencoding pretraining.
 
     Applied to raw LFP input (B, C, n_bands, T) during training only.
     Augments input while reconstruction target uses original (unaugmented) LFP.

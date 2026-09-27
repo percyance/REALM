@@ -1,3 +1,3 @@
-from .masked_pretraining import MaskedLFPPretrainerV2
-from .distill_losses import CrossModalDistillLoss, ReprDynamicsDistillLoss
-from .augmentations import DropPath, PretrainAugmentation
+from .masked_pretraining import MaskedLFPPretrainer
+from .distill_losses import RKDLoss
+from .augmentations import PretrainAugmentation
