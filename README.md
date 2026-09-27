@@ -57,8 +57,6 @@ the paper's trace panels.
 
 The same recipe with a bidirectional student gives **REALM-bi**, an offline (non-causal) reference.
 
-![Neural tokenizer module](figure/neural_tokenizer_module.png)
-
 ## Results
 
 Per-axis R² on the eight held-out sessions (five Makin, three Flint), each split 72/8/20 into
