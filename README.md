@@ -60,9 +60,11 @@ The same recipe with a bidirectional student gives **REALM-bi**, an offline (non
 ## Results
 
 Per-axis R² on the eight held-out sessions (five Makin, three Flint), each split 72/8/20 into
-training, validation and test folds; mean over sessions and three seeds (42, 123, 456).
+training, validation and test folds; mean over sessions and three seeds (42, 123, 456), as
+reported in the paper. The released checkpoints are a single seed (42); their results are given
+under [Evaluate the released models](#evaluate-the-released-models).
 
-| Model | Params | Direction | Label-free | Fine-tuned |
+| Model | Params | Direction | Label-free (3 seeds) | Fine-tuned (3 seeds) |
 |---|---|---|---|---|
 | REALM    | 4.91 M | causal        | 0.561 (Makin 0.519, Flint 0.630) | 0.686 (Makin 0.677, Flint 0.701) |
 | REALM-bi | 5.54 M | bidirectional | 0.588 (Makin 0.547, Flint 0.656) | - |
@@ -105,7 +107,8 @@ split 72/8/20 by `splits/canonical_splits_728020.json`; the test fold is never u
 | `checkpoints/realm_bi_makin.pt` | REALM-bi (5.54 M)           | distilled on the Makin sessions |
 | `checkpoints/realm_bi_flint.pt` | REALM-bi (5.54 M)           | distilled on the Flint sessions |
 
-All students are the seed-42 models of the paper.
+All checkpoints are from a single seed, 42: the students are the paper's seed-42 models. The
+paper's results average three seeds (42, 123, 456); only seed 42 is released.
 
 ## Evaluate the released models
 
@@ -119,9 +122,10 @@ python scripts/finetune.py --ckpt checkpoints/realm_makin.pt --dataset makin --s
 ```
 
 Both scripts print the R² of every held-out session and write a JSON under `output/`. With the
-released seed-42 checkpoints they reproduce the paper's seed-42 runs exactly:
+released checkpoints they reproduce the paper's seed-42 runs exactly. These are single-seed values
+(seed 42 only), so they differ slightly from the three-seed means in [Results](#results):
 
-| Model | Regime | Makin | Flint | All eight |
+| Model | Regime | Makin (seed 42) | Flint (seed 42) | All eight (seed 42) |
 |---|---|---|---|---|
 | REALM    | label-free | 0.520 | 0.624 | 0.559 |
 | REALM-bi | label-free | 0.551 | 0.645 | 0.586 |
