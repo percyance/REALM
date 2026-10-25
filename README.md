@@ -1,6 +1,6 @@
 # REALM: Retrospective Encoder Alignment for LFP Modeling
 
-Code and checkpoints for **REALM**, a causal decoder of arm velocity from intracortical local field
+Code and checkpoints for **REALM**, a causal decoder of movement velocity from intracortical local field
 potentials (LFP). A bidirectional Mamba-2 teacher is pretrained on unlabeled LFP with continuous
 masked autoencoding; its representations are then transferred to a causal Mamba-2 student by
 **retrospective knowledge distillation (RKD)**, without any behavioral labels. The causal student
@@ -13,15 +13,18 @@ decodes one velocity estimate per incoming LFP sample at 100 Hz.
 Two public datasets are used, both recorded with a 96-channel Utah array in primary motor cortex:
 **Makin** (Monkey I; O'Doherty et al.), a self-paced sequential reaching task to random targets,
 and **Flint** (Monkey C), a center-out task. The raw LFP is band-limited to 0.05-50 Hz and resampled
-to 100 Hz. At inference time each LFP frame passes through the **Neural Tokenizer** (per-channel
+to 100 Hz. The models are trained on LFP prepared with the zero-phase chain of CrossModalDistill;
+the held-out sessions are scored under **causal deployment**, where every preprocessing step reads
+only past samples (see [Data](#data)). At inference time each LFP frame passes through the **Neural Tokenizer** (per-channel
 temporal convolution, ECA channel attention, linear projection, LayerNorm), a stack of **causal
 Mamba-2** layers, and a linear read-out of the 2D velocity.
 
 ## Demo
 
-Each clip replays one held-out test segment (5 s at 100 Hz) in real time: the LFP input (left), the
-velocity decoded by REALM after per-session fine-tuning against the recorded velocity (middle), and
-the 2D position obtained by integrating each velocity (right). The segments are the ones shown in
+Each clip replays one held-out test segment (5 s at 100 Hz) in real time under causal deployment:
+the LFP input as the model reads it (left), the velocity decoded by REALM after per-session
+fine-tuning against the recorded velocity (middle), and the 2D position obtained by integrating
+each velocity (right). The segments are the ones shown in
 the paper's trace panels.
 
 **Makin (Monkey I), held-out session indy_20160622_01**
@@ -50,23 +53,28 @@ the paper's trace panels.
    ![Stage 2: retrospective knowledge distillation](figure/distill.png)
 
 3. **Evaluation on held-out sessions**, in two regimes:
-   - *label-free*: the encoder stays frozen and a ridge read-out on the past 10 frames of its
+   - *linear probe*: the encoder stays frozen and a ridge read-out on the past 10 frames of its
      output is fitted on each held-out session;
    - *fine-tuned*: the encoder is adapted on each held-out session with velocity labels (the neural
      tokenizer stays frozen).
 
-The same recipe with a bidirectional student gives **REALM-bi**, an offline (non-causal) reference.
+   Both regimes run under causal deployment: the held-out session is read from its causal copy,
+   and each sample is standardised with the mean and s.d. of the samples before it in the
+   session.
+
+The same recipe with a bidirectional student gives **REALM-bi**, an offline (non-causal) reference,
+scored on the zero-phase copy of the held-out sessions.
 
 ## Results
 
 Per-axis R² on the eight held-out sessions (five Makin, three Flint), each split 72/8/20 into
 training, validation and test folds; mean over sessions and three seeds (42, 123, 456), as
-reported in the paper. The released checkpoints are a single seed (42); their results are given
+reported in the paper. REALM is scored under causal deployment, REALM-bi offline. The released checkpoints are a single seed (42); their results are given
 under [Evaluate the released models](#evaluate-the-released-models).
 
-| Model | Params | Direction | Label-free (3 seeds) | Fine-tuned (3 seeds) |
+| Model | Params | Direction | Linear probe (3 seeds) | Fine-tuned (3 seeds) |
 |---|---|---|---|---|
-| REALM    | 4.91 M | causal        | 0.561 (Makin 0.519, Flint 0.630) | 0.686 (Makin 0.677, Flint 0.701) |
+| REALM    | 4.91 M | causal        | 0.496 (Makin 0.474, Flint 0.533) | 0.636 (Makin 0.638, Flint 0.634) |
 | REALM-bi | 5.54 M | bidirectional | 0.588 (Makin 0.547, Flint 0.656) | - |
 
 ## Setup
@@ -89,6 +97,11 @@ python scripts/preprocess_makin.py       # -> $REALM_DATA/makin/preprocessed/lfp
 python scripts/preprocess_flint.py       # -> $REALM_DATA/flint/preprocessed/lfp/*_rawlfp.npz
 python scripts/make_flint_tukey.py       # held-out Flint sessions, artifact windows removed
 python scripts/make_splits.py            # optional: rebuilds splits/canonical_splits_728020.json
+
+# causal copies of the held-out sessions, used to score REALM under causal deployment
+python scripts/preprocess_makin.py --chain causal --heldout   # -> makin/preprocessed/lfp_causal/
+python scripts/preprocess_flint.py --chain causal --heldout   # -> flint/preprocessed/lfp_causal/
+python scripts/make_flint_tukey.py --chain causal
 # the preprocessing scripts take --session <name> for a single session; --help lists all options
 ```
 
@@ -96,6 +109,14 @@ The held-out sessions are the eight used by CrossModalDistill: Makin `indy_20160
 `indy_20160630_01`, `indy_20160915_01`, `indy_20161013_03`, `indy_20170124_01` and Flint
 `Flint_e1_1`, `Flint_e4_1`, `Flint_e5_2`. Each is cut into non-overlapping 5 s segments that are
 split 72/8/20 by `splits/canonical_splits_728020.json`; the test fold is never used for fitting.
+
+`--chain causal` replaces every step that reads later samples: the decimation, notch and
+band-pass filters become causal (a 0.05 Hz high-pass started from the first sample and a
+minimum-phase FIR band-pass), the FFT resampling becomes causal decimation, and the
+whole-session standardisation is replaced at evaluation time by a per-sample estimate from the
+samples before it (the first 5 s of each session only warm the estimate up and are set to 0). Only the alignment of the Makin LFP to the kinematic clock reads ahead: its
+linear interpolation uses at most the next 100 Hz sample (about 10 ms). The causal copies have
+the same number of segments as the zero-phase ones and use the same splits.
 
 ## Checkpoints
 
@@ -113,7 +134,7 @@ paper's results average three seeds (42, 123, 456); only seed 42 is released.
 ## Evaluate the released models
 
 ```bash
-# label-free: frozen encoder + ridge read-out on each held-out session
+# linear probe: frozen encoder + ridge read-out on each held-out session
 python scripts/eval_labelfree.py --ckpt checkpoints/realm_makin.pt    --dataset makin --seed 42
 python scripts/eval_labelfree.py --ckpt checkpoints/realm_bi_flint.pt --dataset flint --seed 42
 
@@ -121,15 +142,17 @@ python scripts/eval_labelfree.py --ckpt checkpoints/realm_bi_flint.pt --dataset 
 python scripts/finetune.py --ckpt checkpoints/realm_makin.pt --dataset makin --seed 42
 ```
 
-Both scripts print the R² of every held-out session and write a JSON under `output/`. With the
+Both scripts take `--chain causal|zero_phase`; the default is `causal` for a causal checkpoint
+(REALM) and `zero_phase` for a bidirectional one (REALM-bi), as in the paper. They print the R² of
+every held-out session and write a JSON under `output/`. With the
 released checkpoints they reproduce the paper's seed-42 runs exactly. These are single-seed values
 (seed 42 only), so they differ slightly from the three-seed means in [Results](#results):
 
 | Model | Regime | Makin (seed 42) | Flint (seed 42) | All eight (seed 42) |
 |---|---|---|---|---|
-| REALM    | label-free | 0.520 | 0.624 | 0.559 |
-| REALM-bi | label-free | 0.551 | 0.645 | 0.586 |
-| REALM    | fine-tuned | 0.681 | 0.690 | 0.684 |
+| REALM    | linear probe (causal deployment) | 0.462 | 0.520 | 0.484 |
+| REALM-bi | linear probe (offline)           | 0.551 | 0.645 | 0.586 |
+| REALM    | fine-tuned (causal deployment)   | 0.626 | 0.594 | 0.614 |
 
 ## Reproduce the pipeline
 
@@ -156,14 +179,14 @@ deterministic mode the distillation reproduces the paper's runs bitwise.
 ├── models/        Neural tokenizer, Mamba-2 / BiMamba-2 layers, encoder, read-out, configurations
 ├── utils/         Data loading and splits, block masking, distillation loss, augmentations
 ├── scripts/
-│   ├── preprocess_makin.py   raw recordings -> 100 Hz LFP (Makin)
-│   ├── preprocess_flint.py   raw recordings -> 100 Hz LFP (Flint)
-│   ├── preprocessing_utils.py  filtering, re-referencing and resampling shared by both
+│   ├── preprocess_makin.py   raw recordings -> 100 Hz LFP (Makin), zero-phase or causal chain
+│   ├── preprocess_flint.py   raw recordings -> 100 Hz LFP (Flint), zero-phase or causal chain
+│   ├── preprocessing_utils.py  zero-phase and causal filtering, re-referencing and resampling
 │   ├── make_flint_tukey.py   artifact-window removal for the held-out Flint sessions
 │   ├── make_splits.py        72/8/20 splits of the held-out sessions
 │   ├── pretrain.py           stage 1: CMAE pretraining of the teacher
 │   ├── distill.py            stage 2: retrospective distillation (REALM / REALM-bi)
-│   ├── eval_labelfree.py     label-free ridge read-out on held-out sessions
+│   ├── eval_labelfree.py     linear probe: ridge read-out on the frozen encoder
 │   └── finetune.py           per-session supervised fine-tuning
 ├── splits/        canonical 72/8/20 splits of the eight held-out sessions
 ├── checkpoints/   teacher, REALM and REALM-bi (seed 42)

@@ -12,7 +12,7 @@ class REALMDecoder(nn.Module):
 
     The skip maps the current raw LFP sample linearly to velocity and is added to the
     head's output. Distillation is label-free (lambda_task = 0), so neither is used by the
-    label-free read-out; per-session fine-tuning trains a fresh head and zeroes and freezes
+    linear-probe read-out; per-session fine-tuning trains a fresh head and zeroes and freezes
     the skip, so that the prediction comes from the encoder alone.
     """
 

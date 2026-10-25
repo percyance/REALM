@@ -13,6 +13,10 @@ the environment variable REALM_DATA:
   <data root>/flint/preprocessed/lfp_tukey/Flint_*_rawlfp.npz   the 3 held-out Flint
       sessions with outlier windows removed, read instead of lfp/ when tukey_flint=True
 
+Under causal deployment (chain='causal') the held-out sessions are read from lfp_causal/
+(and lfp_causal_tukey/), written by the preprocessing scripts with --chain causal, and every
+sample is re-standardised with the samples before it (samplewise_standardise).
+
 Files placed directly in <corpus>/preprocessed/ are found as well. Sessions are cut into
 non-overlapping 5 s segments (500 samples); channels are zero-padded to 96 and marked in
 a channel mask.
@@ -44,6 +48,7 @@ DATA_ROOT = Path(os.environ.get("REALM_DATA", REPO_ROOT / "data"))
 MAX_CHANNELS = 96
 SEGMENT_LENGTH = 500  # 5 s @ 100 Hz
 BATCH_SIZE = 64
+SAMPLEWISE_WARMUP = 500  # samples (5 s) of the causal standardisation output as 0
 
 # Held-out sessions: never seen in pretraining or distillation, and each split 72/8/20
 # for evaluation. They are the held-out sessions of CrossModalDistill (Erturk et al.,
@@ -59,7 +64,7 @@ HELDOUT_SESSIONS = set(HELDOUT_MAKIN + HELDOUT_FLINT)
 # ── Session discovery ─────────────────────────────────────────────────────
 
 def discover_sessions(datasets: Optional[List[str]] = None,
-                      tukey_flint: bool = False) -> OrderedDict:
+                      tukey_flint: bool = False, chain: str = 'zero_phase') -> OrderedDict:
     """Discover all preprocessed sessions of the requested corpora ('makin', 'flint').
 
     Returns:
@@ -77,11 +82,15 @@ def discover_sessions(datasets: Optional[List[str]] = None,
     for dataset_name, data_dir in search_dirs.items():
         if not data_dir.exists():
             continue
-        # Look in the lfp/ subdirectory first, then directly in preprocessed/.
-        npz_files = sorted((data_dir / "lfp").glob(pat)) or sorted(data_dir.glob(pat))
+        sub = "lfp_causal" if chain == 'causal' else "lfp"
+        if chain == 'causal':
+            npz_files = sorted((data_dir / sub).glob(pat))
+        else:
+            # Look in the lfp/ subdirectory first, then directly in preprocessed/.
+            npz_files = sorted((data_dir / sub).glob(pat)) or sorted(data_dir.glob(pat))
         if tukey_flint:
             # Per file: only the held-out Flint sessions have a filtered copy.
-            tdir = data_dir / "lfp_tukey"
+            tdir = data_dir / f"{sub}_tukey"
             npz_files = [tdir / f.name if (tdir / f.name).exists() else f
                          for f in npz_files]
         for f in npz_files:
@@ -110,6 +119,30 @@ def load_canonical_split(splits_file, session: str, seed: int, n_segments: int,
         raise ValueError(f"{session}: the split was built for {rec['n']} segments, "
                          f"the data has {n_segments}")
     return rec["train"], rec["val"], rec["test"]
+
+
+# ── Past-only standardisation ─────────────────────────────────────────────
+
+def samplewise_standardise(lfp: np.ndarray) -> np.ndarray:
+    """Standardise every sample of a (C, 1, T) session stream with its past only.
+
+    Sample t of each channel is centred and scaled by the mean and s.d. of samples
+    0 ... t-1, so nothing at or after t is read. The first SAMPLEWISE_WARMUP samples (5 s)
+    only feed the statistics and are set to 0: with a handful of past samples the s.d. can
+    be tiny and the standardised value enormous. Zero s.d.s are taken as 1 (padded channels
+    stay 0).
+    """
+    x = torch.from_numpy(np.ascontiguousarray(lfp[:, 0, :], dtype=np.float32)).double()
+    s1 = torch.cumsum(x, dim=1) - x
+    s2 = torch.cumsum(x * x, dim=1) - x * x
+    n = torch.arange(x.shape[1], dtype=torch.float64).unsqueeze(0)
+    mean = s1 / n.clamp(min=1)
+    var = (s2 - n * mean * mean) / (n - 1).clamp(min=1)
+    sd = var.clamp(min=0).sqrt()
+    sd[(sd == 0) | (n < 2).expand_as(sd)] = 1.0
+    out = (x - mean) / sd
+    out[:, :SAMPLEWISE_WARMUP] = 0.0
+    return out.float().numpy()[:, None, :]
 
 
 # ── R² metric ────────────────────────────────────────────────────────────
@@ -296,17 +329,21 @@ def create_test_dataloaders(
     num_workers: int = 0,
     tukey_flint: bool = False,
     datasets: Optional[List[str]] = None,
+    chain: str = 'zero_phase',
 ) -> Dict[str, DataLoader]:
     """Per-session dataloaders over every segment of each held-out session, in time order.
 
     Each item: {'lfp': (96, 1, T), 'target': (T, 2), 'channel_mask': (96,)}
+
+    chain='causal' reads the causal copies and standardises the stream of whole segments
+    with past samples only, as in the paper's causal deployment.
 
     Returns:
         {session_name: DataLoader}
     """
     if datasets is None:
         datasets = ['makin', 'flint']
-    sessions = discover_sessions(datasets=datasets, tukey_flint=tukey_flint)
+    sessions = discover_sessions(datasets=datasets, tukey_flint=tukey_flint, chain=chain)
     test_loaders = {}
 
     for name, info in sessions.items():
@@ -324,6 +361,9 @@ def create_test_dataloaders(
 
         # Non-overlapping segments covering whole session
         T = lfp.shape[2]
+        if chain == 'causal':
+            n_seg = (T - segment_length) // segment_length + 1
+            lfp = samplewise_standardise(lfp[:, :, :n_seg * segment_length])
         segments = []
         for start in range(0, T - segment_length + 1, segment_length):
             end = start + segment_length

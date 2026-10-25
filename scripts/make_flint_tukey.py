@@ -7,10 +7,10 @@ such rule. The rule looks at behaviour only, so it is applied to the held-out ev
 sessions alone, and whole 10 s windows are dropped so that every 5 s segment stays
 continuous in time.
 
-Input:  $REALM_DATA/flint/preprocessed/lfp/<session>_rawlfp.npz
-Output: $REALM_DATA/flint/preprocessed/lfp_tukey/<session>_rawlfp.npz, the same file with the
-        rejected windows removed and the kept-window mask stored as `tukey_kept_windows`.
-        Evaluation reads these files for Flint (--tukey_flint in the evaluation scripts).
+Input:  $REALM_DATA/flint/preprocessed/lfp/<session>_rawlfp.npz (lfp_causal/ for --chain causal)
+Output: $REALM_DATA/flint/preprocessed/lfp_tukey/<session>_rawlfp.npz (lfp_causal_tukey/), the
+        same file with the rejected windows removed and the kept-window mask stored as
+        `tukey_kept_windows`. Evaluation reads these files for Flint.
 """
 import argparse
 import os
@@ -33,12 +33,17 @@ def keep_mask(vel, win=WIN):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--in_dir", default=str(DATA_ROOT / "flint" / "preprocessed" / "lfp"))
-    ap.add_argument("--out_dir", default=str(DATA_ROOT / "flint" / "preprocessed" / "lfp_tukey"))
+    ap.add_argument("--chain", default="zero_phase", choices=["zero_phase", "causal"],
+                    help="which preprocessed copy to filter (default: zero_phase)")
+    ap.add_argument("--in_dir", default=None, help="default: flint/preprocessed/lfp/ "
+                                                   "(lfp_causal/ for --chain causal)")
+    ap.add_argument("--out_dir", default=None, help="default: <in_dir>_tukey")
     ap.add_argument("--sessions", nargs="+", default=SESSIONS)
     args = ap.parse_args()
 
-    in_dir, out_dir = Path(args.in_dir), Path(args.out_dir)
+    sub = "lfp_causal" if args.chain == "causal" else "lfp"
+    in_dir = Path(args.in_dir or DATA_ROOT / "flint" / "preprocessed" / sub)
+    out_dir = Path(args.out_dir or DATA_ROOT / "flint" / "preprocessed" / f"{sub}_tukey")
     out_dir.mkdir(parents=True, exist_ok=True)
     for sess in args.sessions:
         z = np.load(in_dir / f"{sess}_rawlfp.npz", allow_pickle=True)

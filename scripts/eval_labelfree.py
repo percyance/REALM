@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Label-free evaluation: a ridge read-out on the frozen encoder, per held-out session.
+Linear-probe evaluation: a ridge read-out on the frozen encoder, per held-out session.
 
-The encoder is used exactly as distilled; velocity labels reach only the read-out. For each
-held-out session of the chosen corpus:
+The encoder is used exactly as distilled; velocity labels reach only the read-out. A causal
+encoder (REALM) is scored under causal deployment by default: the held-out session is read
+from its causal copy and standardised with past samples only (--chain causal). A
+bidirectional encoder (REALM-bi) is an offline reference and is scored on the zero-phase
+copy (--chain zero_phase). For each held-out session of the chosen corpus:
 
   1. The session's non-overlapping 5 s segments are split 72/8/20 into training, validation
      and test folds (splits/canonical_splits_728020.json).
@@ -168,7 +171,7 @@ def evaluate_session(encoder, loader, session, args, tukey):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Label-free evaluation: ridge read-out on the frozen encoder, "
+        description="Linear-probe evaluation: ridge read-out on the frozen encoder, "
                     "per held-out session.")
     parser.add_argument('--ckpt', type=str, required=True,
                         help="REALM / REALM-bi checkpoint (or the teacher)")
@@ -182,27 +185,32 @@ def main():
                         help="split file (default: splits/canonical_splits_728020.json)")
     parser.add_argument('--context', type=int, default=10,
                         help="past frames stacked with the current one (default: 10)")
+    parser.add_argument('--chain', type=str, default=None, choices=['causal', 'zero_phase'],
+                        help="preprocessing of the held-out sessions (default: causal for a "
+                             "causal encoder, zero_phase for a bidirectional one)")
     parser.add_argument('--no_tukey', action='store_true',
                         help="read Flint without the artifact-window removal "
                              "(the paper scores Flint on the filtered files)")
     parser.add_argument('--out', type=str, default=None,
-                        help="result JSON (default: output/labelfree_<ckpt>_<dataset>"
-                             "_s<seed>.json)")
+                        help="result JSON (default: output/linear_probe_<ckpt>_<dataset>"
+                             "_<chain>_s<seed>.json)")
     args = parser.parse_args()
 
     tukey = args.dataset == 'flint' and not args.no_tukey
     set_seed(args.seed)
     encoder, kwargs = load_encoder(args.ckpt)
     mode = 'bidirectional' if kwargs['bidirectional'] else 'causal'
+    chain = args.chain or ('zero_phase' if kwargs['bidirectional'] else 'causal')
     print(f"Checkpoint: {args.ckpt}  ({mode} encoder, {kwargs['n_layers']} layers)")
-    print(f"Data: {DATA_ROOT}  corpus: {args.dataset}"
+    print(f"Data: {DATA_ROOT}  corpus: {args.dataset}  chain: {chain}"
           f"{'  (Flint artifact windows removed)' if tukey else ''}")
     print(f"Read-out: ridge on frames t-{args.context}..t, penalty from "
           f"{{{', '.join(f'{a:g}' for a in ALPHA_GRID)}}} chosen on the validation fold; "
           f"split seed {args.seed}")
 
     loaders = create_test_dataloaders(segment_length=SEGMENT_LENGTH, batch_size=BATCH_SIZE,
-                                      tukey_flint=tukey, datasets=[args.dataset])
+                                      tukey_flint=tukey, datasets=[args.dataset],
+                                      chain=chain)
     missing = [s for s in HELDOUT[args.dataset] if s not in loaders]
     if missing:
         raise FileNotFoundError(f"held-out sessions not found under {DATA_ROOT}: {missing}")
@@ -223,11 +231,13 @@ def main():
     print(f"  {'mean':<18} R2={mean_r2:.4f}  over {len(per_session)} sessions")
 
     out = Path(args.out) if args.out else (
-        Path('output') / f"labelfree_{Path(args.ckpt).stem}_{args.dataset}_s{args.seed}.json")
+        Path('output') / f"linear_probe_{Path(args.ckpt).stem}_{args.dataset}_{chain}"
+                         f"_s{args.seed}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     result = {
         'checkpoint': str(args.ckpt), 'encoder': mode, 'dataset': args.dataset,
-        'seed': args.seed, 'splits_file': str(args.splits_file), 'flint_tukey': tukey,
+        'seed': args.seed, 'chain': chain, 'splits_file': str(args.splits_file),
+        'flint_tukey': tukey,
         'context': args.context, 'alpha_grid': list(ALPHA_GRID),
         'per_session': per_session, 'mean_r2': mean_r2,
     }

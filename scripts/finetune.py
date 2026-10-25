@@ -12,7 +12,10 @@ Each held-out session is fine-tuned independently, starting from the same checkp
     best epoch's weights are scored once on the test fold (per-axis R²).
 
 The encoder runs causally for a causal checkpoint (REALM) and bidirectionally for a
-bidirectional one (REALM-bi). Flint sessions are read from the Tukey-filtered files written
+bidirectional one (REALM-bi). A causal checkpoint is fine-tuned and scored under causal
+deployment by default: the held-out session is read from its causal copy and standardised
+with past samples only (--chain causal); training and validation folds see the same
+signal. Flint sessions are read from the Tukey-filtered files written
 by scripts/make_flint_tukey.py unless --no_tukey is given.
 
 Usage:
@@ -199,11 +202,14 @@ def main():
                         help="peak learning rate; cosine annealing to 1%% of it")
     parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--out', default=None,
-                        help="result JSON (default: output/finetune_<ckpt>_<dataset>_s<seed>.json)")
+                        help="result JSON (default: output/finetune_<ckpt>_<dataset>_<chain>_s<seed>.json)")
     parser.add_argument('--dump_pred', default=None, metavar='DIR',
                         help="write each session's test-fold predictions and targets here")
     parser.add_argument('--save_dir', default=None, metavar='DIR',
                         help="write each session's fine-tuned weights here")
+    parser.add_argument('--chain', default=None, choices=['causal', 'zero_phase'],
+                        help="preprocessing of the held-out sessions (default: causal for a "
+                             "causal encoder, zero_phase for a bidirectional one)")
     parser.add_argument('--no_tukey', action='store_true',
                         help="read Flint from the unfiltered files instead of the Tukey-filtered ones")
     args = parser.parse_args()
@@ -213,10 +219,15 @@ def main():
     tukey = args.dataset == 'flint' and not args.no_tukey
     heldout = HELDOUT_MAKIN if args.dataset == 'makin' else HELDOUT_FLINT
 
+    bidirectional = torch.load(ckpt_path, map_location='cpu',
+                               weights_only=False)['encoder_kwargs']['bidirectional']
+    chain = args.chain or ('zero_phase' if bidirectional else 'causal')
+
     set_seed(args.seed)
     print(f"Device: {DEVICE}  checkpoint: {ckpt_path}  dataset: {args.dataset}  "
-          f"seed: {args.seed}  tukey_flint: {tukey}", flush=True)
-    loaders = create_test_dataloaders(batch_size=256, tukey_flint=tukey, datasets=[args.dataset])
+          f"seed: {args.seed}  chain: {chain}  tukey_flint: {tukey}", flush=True)
+    loaders = create_test_dataloaders(batch_size=256, tukey_flint=tukey, datasets=[args.dataset],
+                                      chain=chain)
     missing = sorted(set(heldout) - set(loaders))
     if missing:
         raise FileNotFoundError(f"held-out sessions not found under the data root: {missing}")
@@ -272,14 +283,15 @@ def main():
 
     result = {
         'checkpoint': str(args.ckpt), 'dataset': args.dataset, 'seed': args.seed,
-        'splits_file': str(args.splits_file), 'tukey_flint': tukey,
+        'chain': chain, 'splits_file': str(args.splits_file), 'tukey_flint': tukey,
         'per_session_r2': per_session, 'mean_r2': mean_r2,
         'per_session_val_r2': per_session_val, 'best_epoch': best_epochs,
         'settings': {k: getattr(args, k) for k in
                      ('epochs', 'patience', 'batch_size', 'lr', 'weight_decay')},
     }
     out = Path(args.out) if args.out else (
-        REPO_ROOT / 'output' / f"finetune_{Path(args.ckpt).stem}_{args.dataset}_s{args.seed}.json")
+        REPO_ROOT / 'output' / f"finetune_{Path(args.ckpt).stem}_{args.dataset}_{chain}"
+                               f"_s{args.seed}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2))
     print(f"saved {out}")
